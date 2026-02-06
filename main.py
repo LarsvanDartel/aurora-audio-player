@@ -1,4 +1,5 @@
 import os
+import time
 import socketio
 from dotenv import load_dotenv
 import vlc
@@ -25,6 +26,11 @@ last_audio_sync = 0
 
 auth_cookie = ''
 audio_listener_id = -1
+
+status_thread: Thread | None = None
+status_thread_running = False
+start_time = 0
+latency_ms = 0
 
 
 def get_headers():
@@ -69,10 +75,55 @@ def stop_sync_loop():
     sync_thread.join()
 
 
-def main():
-    global sio, player, running, auth_cookie, audio_listener_id
+def send_status_updates():
+    global status_thread_running, sio
 
-    url =  urljoin(os.environ['URL'], '/api/auth/key')
+    while status_thread_running:
+        uptime_seconds = int(time.time() - start_time)
+        system_timestamp = math.floor(time.time_ns() / 1000000)
+        last_send_time = system_timestamp
+
+        def status_update_callback():
+            global latency_ms
+            callback_time = time.time_ns() / 1000000
+            rtt = callback_time - last_send_time
+            latency_ms = int(rtt / 2)
+            logging.info(f"Latency: {latency_ms} ms")
+
+        sio.emit('status:update', {
+            'uptimeSeconds': uptime_seconds,
+            'systemTimestamp': system_timestamp,
+            'latencyMilliseconds': latency_ms,
+        }, namespace='/', callback=status_update_callback)
+
+        time.sleep(5)
+
+
+def create_status_loop():
+    global status_thread, status_thread_running
+
+    status_thread_running = True
+    status_thread = Thread(target=send_status_updates)
+    status_thread.daemon = True
+    status_thread.start()
+
+
+def stop_status_loop():
+    global status_thread, status_thread_running
+
+    if status_thread is None:
+        return
+
+    status_thread_running = False
+    status_thread.join()
+
+
+def main():
+    global sio, player, running, auth_cookie, audio_listener_id, start_time
+
+    start_time = time.time()
+
+    url = urljoin(os.environ['URL'], '/api/auth/key')
     result = requests.post(url, {'key': os.environ['API_KEY']})
 
     json = result.json()
@@ -97,6 +148,7 @@ def main():
     except KeyboardInterrupt:
         running = False
         stop_audio()
+        stop_status_loop()
 
 
 def set_audio_playing(playing: bool):
@@ -196,6 +248,12 @@ def disconnect():
         player = None
 
     set_audio_playing(False)
+    stop_status_loop()
+
+
+@sio.event
+def connect():
+    create_status_loop()
 
 
 if __name__ == '__main__':
